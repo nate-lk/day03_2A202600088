@@ -1,74 +1,95 @@
-import os
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from src.core.llm_provider import LLMProvider
 from src.telemetry.logger import logger
 
+
 class ReActAgent:
-    """
-    SKELETON: A ReAct-style Agent that follows the Thought-Action-Observation loop.
-    Students should implement the core loop logic and tool execution.
-    """
-    
     def __init__(self, llm: LLMProvider, tools: List[Dict[str, Any]], max_steps: int = 5):
         self.llm = llm
         self.tools = tools
         self.max_steps = max_steps
         self.history = []
 
-    def get_system_prompt(self) -> str:
-        """
-        TODO: Implement the system prompt that instructs the agent to follow ReAct.
-        Should include:
-        1.  Available tools and their descriptions.
-        2.  Format instructions: Thought, Action, Observation.
-        """
-        tool_descriptions = "\n".join([f"- {t['name']}: {t['description']}" for t in self.tools])
-        return f"""
-        You are an intelligent assistant. You have access to the following tools:
-        {tool_descriptions}
+        # Registry: map tool name -> callable
+        self._tool_registry: Dict[str, Any] = {t["name"]: t["fn"] for t in tools if "fn" in t}
 
-        Use the following format:
-        Thought: your line of reasoning.
-        Action: tool_name(arguments)
-        Observation: result of the tool call.
-        ... (repeat Thought/Action/Observation if needed)
-        Final Answer: your final response.
-        """
+    def get_system_prompt(self) -> str:
+        tool_descriptions = "\n".join(
+            [f"- {t['name']}: {t['description']}" for t in self.tools]
+        )
+        return f"""
+You are an intelligent assistant. You have access to the following tools:
+{tool_descriptions}
+
+Use EXACTLY this format:
+Thought: your line of reasoning.
+Action: tool_name("arg1", "arg2")
+Observation: result of the tool call.
+... (repeat Thought/Action/Observation as needed)
+Final Answer: your final response to the user.
+
+Rules:
+- Always produce a Thought before an Action.
+- Only call tools that are listed above.
+- When you have enough information, write Final Answer.
+"""
 
     def run(self, user_input: str) -> str:
-        """
-        TODO: Implement the ReAct loop logic.
-        1. Generate Thought + Action.
-        2. Parse Action and execute Tool.
-        3. Append Observation to prompt and repeat until Final Answer.
-        """
         logger.log_event("AGENT_START", {"input": user_input, "model": self.llm.model_name})
-        
-        current_prompt = user_input
+
+        # Seed the conversation with the user message
+        self.history.append({"role": "user", "content": user_input})
         steps = 0
 
         while steps < self.max_steps:
-            # TODO: Generate LLM response
-            # result = self.llm.generate(current_prompt, system_prompt=self.get_system_prompt())
-            
-            # TODO: Parse Thought/Action from result
-            
-            # TODO: If Action found -> Call tool -> Append Observation
-            
-            # TODO: If Final Answer found -> Break loop
-            
-            steps += 1
-            
-        logger.log_event("AGENT_END", {"steps": steps})
-        return "Not implemented. Fill in the TODOs!"
+            # 1. Ask the LLM for the next Thought/Action (or Final Answer)
+            result = self.llm.generate(
+                self.history,
+                system_prompt=self.get_system_prompt(),
+            )
 
-    def _execute_tool(self, tool_name: str, args: str) -> str:
-        """
-        Helper method to execute tools by name.
-        """
-        for tool in self.tools:
-            if tool['name'] == tool_name:
-                # TODO: Implement dynamic function calling or simple if/else
-                return f"Result of {tool_name}"
-        return f"Tool {tool_name} not found."
+            # Append raw assistant output to history
+            self.history.append({"role": "assistant", "content": result})
+            logger.log_event("LLM_OUTPUT", {"step": steps, "output": result})
+
+            # 2. Check for Final Answer first
+            final = re.search(r"Final Answer:\s*(.+)", result, re.DOTALL)
+            if final:
+                answer = final.group(1).strip()
+                logger.log_event("AGENT_END", {"steps": steps, "answer": answer})
+                return answer
+
+            # 3. Parse Action: tool_name("arg1", "arg2")
+            action_match = re.search(r"Action:\s*(\w+)\((.*?)\)", result, re.DOTALL)
+            if action_match:
+                tool_name = action_match.group(1).strip()
+                raw_args  = action_match.group(2).strip()
+
+                # Execute the tool
+                observation = self._execute_tool(tool_name, raw_args)
+                logger.log_event("TOOL_CALL", {"tool": tool_name, "args": raw_args, "result": observation})
+
+                # Feed the observation back as a user message so the LLM continues
+                self.history.append({
+                    "role": "user",
+                    "content": f"Observation: {observation}",
+                })
+
+            steps += 1
+
+        logger.log_event("AGENT_END", {"steps": steps, "answer": "max steps reached"})
+        return "I reached the maximum number of reasoning steps without a final answer."
+
+    def _execute_tool(self, tool_name: str, raw_args: str) -> str:
+        if tool_name not in self._tool_registry:
+            return f"Tool '{tool_name}' not found."
+
+        # Parse comma-separated string args, stripping quotes
+        args = [a.strip().strip('"').strip("'") for a in raw_args.split(",") if a.strip()]
+
+        try:
+            result = self._tool_registry[tool_name](*args)
+            return str(result)
+        except Exception as e:
+            return f"Error running {tool_name}: {e}"
